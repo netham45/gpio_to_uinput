@@ -1,0 +1,29 @@
+# gpio.map for gpio_to_uinput.cpp (hat dpad + gamepad buttons + keyboard hotkey)
+
+# D-pad as hat switch
+4  HAT_UP
+15 HAT_DOWN
+14 HAT_LEFT
+18 HAT_RIGHT
+
+# Face buttons
+20 BTN_EAST
+21 BTN_SOUTH
+16 BTN_WEST
+26 BTN_NORTH
+
+# Start/Select
+8  BTN_SELECT
+25 BTN_START
+
+# Triggers
+7  BTN_TL
+23 BTN_TR
+
+# Volume controls as keyboard keys (Android will handle these as volume)
+22 KEY_VOLUMEUP
+27 KEY_VOLUMEDOWN
+
+# Hotkey (pick what you want; ESC is a good default)
+17 BTN_MODE
+
