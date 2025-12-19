@@ -39,6 +39,7 @@
 //   Android: getevent -lp
 
 #include <linux/gpio.h>
+#include <linux/i2c-dev.h>
 #include <linux/uinput.h>
 
 #include <fcntl.h>
@@ -49,6 +50,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -64,6 +66,12 @@
 static void die(const std::string& msg) {
   std::cerr << "ERROR: " << msg << " (errno=" << errno << " " << std::strerror(errno) << ")\n";
   std::exit(1);
+}
+
+static uint64_t monotonic_ns() {
+  timespec ts{};
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) die("clock_gettime");
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 }
 
 static int xopen(const std::string& path, int flags) {
@@ -98,6 +106,10 @@ static bool is_all_digits(const std::string& s) {
   if (s.empty()) return false;
   for (char c : s) if (!std::isdigit((unsigned char)c)) return false;
   return true;
+}
+
+static uint16_t get_u16_le(const uint8_t* p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
 static std::optional<gpio_v2_line_info> get_line_info(int chip_fd, uint32_t offset) {
@@ -179,6 +191,18 @@ struct Action {
   int code;           // EV_KEY code for ButtonOrKey
   HatDir hat_dir;     // for HatDir
   std::string token;  // original token for logging
+};
+
+enum class MapEntryKind { Gpio, I2cDigital };
+
+struct MapEntryKey {
+  MapEntryKind kind;
+  uint32_t id;
+};
+
+struct MappingResult {
+  std::unordered_map<uint32_t, Action> gpio;
+  std::unordered_map<uint32_t, Action> i2c_digital;
 };
 
 // Buttons we explicitly support by name (still can use numeric fallback).
@@ -371,8 +395,36 @@ static std::optional<Action> action_from_token(std::string tok) {
   return Action{ActionType::ButtonOrKey, DeviceKind::Keyboard, *kc, HatDir::Up, tok};
 }
 
-static std::unordered_map<uint32_t, Action> load_mapping_file(const std::string& path) {
-  std::unordered_map<uint32_t, Action> m;
+static std::optional<MapEntryKey> parse_map_target(std::string tok) {
+  tok = upper(trim(tok));
+  if (tok.empty()) return std::nullopt;
+
+  if (is_all_digits(tok)) {
+    return MapEntryKey{MapEntryKind::Gpio, (uint32_t)std::stoul(tok)};
+  }
+
+  auto parse_i2c_pin = [](const std::string& digits) -> std::optional<MapEntryKey> {
+    if (!is_all_digits(digits)) return std::nullopt;
+    uint32_t pin = (uint32_t)std::stoul(digits);
+    if (pin < 2 || pin > 13) return std::nullopt;
+    return MapEntryKey{MapEntryKind::I2cDigital, pin};
+  };
+
+  if (tok.rfind("I2C:", 0) == 0) {
+    std::string rest = tok.substr(4);
+    if (!rest.empty() && rest[0] == 'D') rest = rest.substr(1);
+    return parse_i2c_pin(rest);
+  }
+
+  if (tok[0] == 'D' && tok.size() > 1) {
+    return parse_i2c_pin(tok.substr(1));
+  }
+
+  return std::nullopt;
+}
+
+static MappingResult load_mapping_file(const std::string& path) {
+  MappingResult m;
   std::ifstream in(path);
   if (!in) die("open map file: " + path);
 
@@ -392,25 +444,35 @@ static std::unordered_map<uint32_t, Action> load_mapping_file(const std::string&
       continue;
     }
 
-    uint32_t off = (uint32_t)std::stoul(gpio_s);
+    auto target = parse_map_target(gpio_s);
+    if (!target) {
+      std::cerr << "WARN: unknown target '" << gpio_s << "' on line " << ln << "\n";
+      continue;
+    }
+
     auto act = action_from_token(tok);
     if (!act) {
       std::cerr << "WARN: unknown token '" << tok << "' on line " << ln << "\n";
       continue;
     }
-    m[off] = *act;
+
+    if (target->kind == MapEntryKind::Gpio) {
+      m.gpio[target->id] = *act;
+    } else {
+      m.i2c_digital[target->id] = *act;
+    }
   }
   return m;
 }
 
 // Defaults based on your earlier log: arrows -> hat, enter -> BTN_SOUTH (A)
-static std::unordered_map<uint32_t, Action> default_mapping_from_your_log() {
-  std::unordered_map<uint32_t, Action> m;
-  m[15] = *action_from_token("HAT_UP");
-  m[18] = *action_from_token("HAT_DOWN");
-  m[4]  = *action_from_token("HAT_LEFT");
-  m[14] = *action_from_token("HAT_RIGHT");
-  m[21] = *action_from_token("BTN_SOUTH");
+static MappingResult default_mapping_from_your_log() {
+  MappingResult m;
+  m.gpio[15] = *action_from_token("HAT_UP");
+  m.gpio[18] = *action_from_token("HAT_DOWN");
+  m.gpio[4]  = *action_from_token("HAT_LEFT");
+  m.gpio[14] = *action_from_token("HAT_RIGHT");
+  m.gpio[21] = *action_from_token("BTN_SOUTH");
   return m;
 }
 
@@ -431,16 +493,46 @@ static void setup_abs_hat(int ufd, uint16_t code) {
   }
 }
 
-static int create_uinput_gamepad(const std::set<int>& button_codes, bool need_hat) {
+struct AbsAxisSetup {
+  uint16_t code;
+  int min;
+  int max;
+};
+
+static void setup_abs_axis(int ufd, const AbsAxisSetup& axis) {
+  if (ioctl(ufd, UI_SET_ABSBIT, axis.code) < 0) die("UI_SET_ABSBIT");
+  uinput_abs_setup abs{};
+  abs.code = axis.code;
+  abs.absinfo.minimum = axis.min;
+  abs.absinfo.maximum = axis.max;
+  abs.absinfo.fuzz = 0;
+  abs.absinfo.flat = 0;
+  abs.absinfo.resolution = 0;
+  if (ioctl(ufd, UI_ABS_SETUP, &abs) < 0) {
+    std::cerr << "WARN: UI_ABS_SETUP failed for ABS code " << axis.code
+              << " (errno=" << errno << " " << std::strerror(errno) << ")\n";
+  }
+}
+
+static int create_uinput_gamepad(const std::set<int>& button_codes,
+                                 bool need_hat,
+                                 const std::vector<AbsAxisSetup>& analog_axes) {
   int ufd = xopen("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 
   if (ioctl(ufd, UI_SET_EVBIT, EV_KEY) < 0) die("UI_SET_EVBIT EV_KEY");
   if (ioctl(ufd, UI_SET_EVBIT, EV_SYN) < 0) die("UI_SET_EVBIT EV_SYN");
 
-  if (need_hat) {
+  if (need_hat || !analog_axes.empty()) {
     if (ioctl(ufd, UI_SET_EVBIT, EV_ABS) < 0) die("UI_SET_EVBIT EV_ABS");
+  }
+
+  if (need_hat) {
     setup_abs_hat(ufd, ABS_HAT0X);
     setup_abs_hat(ufd, ABS_HAT0Y);
+  }
+
+  for (const auto& axis : analog_axes) {
+    setup_abs_axis(ufd, axis);
   }
 
   // Marker: many stacks like seeing BTN_GAMEPAD.
@@ -468,6 +560,14 @@ static int create_uinput_gamepad(const std::set<int>& button_codes, bool need_ha
   if (need_hat) {
     uinput_abs(ufd, ABS_HAT0X, 0);
     uinput_abs(ufd, ABS_HAT0Y, 0);
+    uinput_syn(ufd);
+  }
+
+  if (!analog_axes.empty()) {
+    for (const auto& axis : analog_axes) {
+      int center = std::max(axis.min, std::min(axis.max, (axis.min + axis.max) / 2));
+      uinput_abs(ufd, axis.code, center);
+    }
     uinput_syn(ufd);
   }
 
@@ -533,6 +633,10 @@ static int next_auto_key_code(int idx) {
 
 static void print_options_and_exit() {
   std::cout
+    << "Mapping targets (first column in map file):\n"
+    << "  <gpio_offset>    -> numeric GPIO offset (e.g. 17)\n"
+    << "  D2 .. D13        -> Arduino I2C digital pins (when --i2c-dev is used)\n"
+    << "  I2C:D2 .. D13    -> explicit I2C notation; same as bare D#\n\n"
     << "Valid mapping tokens for this program:\n\n"
     << "HAT (gamepad hat switch):\n"
     << "  HAT_UP, HAT_DOWN, HAT_LEFT, HAT_RIGHT\n\n"
@@ -562,6 +666,48 @@ struct WatchedLine {
   std::string name;
 };
 
+struct I2cButtonBinding {
+  uint32_t pin;
+  Action action;
+};
+
+struct I2cAnalogAxisState {
+  size_t raw_index;
+  std::string label;
+  uint16_t abs_code;
+  uint16_t max_seen = 1;
+  int last_scaled = -1;
+};
+
+struct I2cState {
+  bool enabled = false;
+  int fd = -1;
+  uint64_t interval_ns = 0;
+  uint64_t next_poll_ns = 0;
+  uint16_t last_mask = 0;
+  bool have_mask = false;
+  bool read_error_logged = false;
+  std::unordered_map<uint32_t, I2cButtonBinding> button_bits;  // keyed by bit index 0..11
+  std::vector<I2cAnalogAxisState> analogs;
+};
+
+struct I2cAnalogChannelDesc {
+  const char* label;
+  size_t raw_index;
+  uint16_t abs_code;
+};
+
+static constexpr size_t kI2cAnalogValueCount = 5;
+static constexpr size_t kI2cFrameBytes = (kI2cAnalogValueCount + 1) * sizeof(uint16_t);
+
+static const I2cAnalogChannelDesc kDefaultI2cAnalogs[] = {
+  {"A0", 0, ABS_X},
+  {"A1", 1, ABS_Y},
+  {"A2", 2, ABS_RX},
+  {"A3", 3, ABS_RY},
+  {"A6", 4, ABS_Z},
+};
+
 int main(int argc, char** argv) {
   std::string chip_path = "/dev/gpiochip0";
   uint32_t start = 2;
@@ -569,6 +715,11 @@ int main(int argc, char** argv) {
   uint32_t debounce_us = 10000;
   uint32_t event_buf_sz = 256;
   std::string map_path;
+  std::string i2c_dev_path;
+  int i2c_addr = 0x42;
+  int i2c_interval_ms = 5;
+  bool i2c_log_samples = false;
+  bool i2c_disable_axes = false;
 
   bool active_low = true;
   AutoMode auto_mode = AutoMode::Buttons;
@@ -597,7 +748,15 @@ int main(int argc, char** argv) {
     else if (a == "--debounce-us") debounce_us = (uint32_t)std::stoul(need("--debounce-us"));
     else if (a == "--event-buf") event_buf_sz = (uint32_t)std::stoul(need("--event-buf"));
     else if (a == "--map") map_path = need("--map");
+    else if (a == "--i2c-dev") i2c_dev_path = need("--i2c-dev");
+    else if (a == "--i2c-addr") {
+      std::string v = need("--i2c-addr");
+      i2c_addr = (int)std::stoul(v, nullptr, 0);
+    }
+    else if (a == "--i2c-interval-ms") i2c_interval_ms = std::max(1, std::stoi(need("--i2c-interval-ms")));
     else if (a == "--active-high") active_low = false;
+    else if (a == "--i2c-log") i2c_log_samples = true;
+    else if (a == "--i2c-no-axes") i2c_disable_axes = true;
     else if (a == "--auto") {
       std::string v = upper(trim(need("--auto")));
       if (v == "BUTTONS") auto_mode = AutoMode::Buttons;
@@ -611,6 +770,8 @@ int main(int argc, char** argv) {
         << "Usage:\n"
         << "  " << argv[0] << " [--chip /dev/gpiochipN] [--start N] [--end N]\n"
         << "             [--debounce-us N] [--event-buf N] [--map path] [--active-high]\n"
+        << "             [--i2c-dev /dev/i2c-X] [--i2c-addr 0x42] [--i2c-interval-ms N]\n"
+        << "             [--i2c-log] [--i2c-no-axes]\n"
         << "             [--auto buttons|keys|none] [--list-options]\n\n"
         << "Defaults: chip=/dev/gpiochip0 start=2 end=27 debounce-us=10000 auto=buttons\n";
       return 2;
@@ -626,8 +787,10 @@ int main(int argc, char** argv) {
   if (end >= cinfo.lines) end = cinfo.lines - 1;
 
   // Build mapping.
-  std::unordered_map<uint32_t, Action> map =
+  MappingResult mapping =
       map_path.empty() ? default_mapping_from_your_log() : load_mapping_file(map_path);
+  auto& gpio_map = mapping.gpio;
+  auto& i2c_button_map = mapping.i2c_digital;
 
   // Auto-assign unmapped offsets in range.
   std::vector<uint32_t> candidates;
@@ -638,17 +801,17 @@ int main(int argc, char** argv) {
   std::sort(candidates.begin(), candidates.end());
 
   std::set<int> used_btn, used_key;
-  for (const auto& kv : map) {
-    const Action& a = kv.second;
-    if (a.type == ActionType::ButtonOrKey) {
-      if (a.dev == DeviceKind::Gamepad) used_btn.insert(a.code);
-      else used_key.insert(a.code);
-    }
-  }
+  auto register_action = [&](const Action& a) {
+    if (a.type != ActionType::ButtonOrKey) return;
+    if (a.dev == DeviceKind::Gamepad) used_btn.insert(a.code);
+    else used_key.insert(a.code);
+  };
+  for (const auto& kv : gpio_map) register_action(kv.second);
+  for (const auto& kv : i2c_button_map) register_action(kv.second);
 
   int auto_idx = 0;
   for (uint32_t off : candidates) {
-    if (map.find(off) != map.end()) continue;
+    if (gpio_map.find(off) != gpio_map.end()) continue;
     if (auto_mode == AutoMode::None) continue;
 
     if (auto_mode == AutoMode::Buttons) {
@@ -658,7 +821,7 @@ int main(int argc, char** argv) {
         if (used_btn.insert(code).second) break;
         if (auto_idx > 2000) break;
       }
-      map[off] = Action{ActionType::ButtonOrKey, DeviceKind::Gamepad, code, HatDir::Up, "AUTO_BTN"};
+      gpio_map[off] = Action{ActionType::ButtonOrKey, DeviceKind::Gamepad, code, HatDir::Up, "AUTO_BTN"};
     } else {
       int code;
       for (;;) {
@@ -666,15 +829,15 @@ int main(int argc, char** argv) {
         if (used_key.insert(code).second) break;
         if (auto_idx > 2000) break;
       }
-      map[off] = Action{ActionType::ButtonOrKey, DeviceKind::Keyboard, code, HatDir::Up, "AUTO_KEY"};
+      gpio_map[off] = Action{ActionType::ButtonOrKey, DeviceKind::Keyboard, code, HatDir::Up, "AUTO_KEY"};
     }
   }
 
   // Request GPIO lines (skip used/consumer/output).
   std::vector<WatchedLine> watched;
-  watched.reserve(map.size());
+  watched.reserve(gpio_map.size());
 
-  for (const auto& kv : map) {
+  for (const auto& kv : gpio_map) {
     uint32_t off = kv.first;
     if (off < start || off > end) continue;
     if (is_excluded(off)) continue;
@@ -695,10 +858,44 @@ int main(int argc, char** argv) {
     watched.push_back(WatchedLine{*fdOpt, off, lname});
   }
 
-  if (watched.empty()) {
-    std::cerr << "No lines could be requested.\n"
+  I2cState i2c_state;
+  std::vector<AbsAxisSetup> analog_axis_setup;
+  if (!i2c_dev_path.empty()) {
+    i2c_state.enabled = true;
+    i2c_state.fd = xopen(i2c_dev_path, O_RDWR | O_CLOEXEC);
+    if (ioctl(i2c_state.fd, I2C_SLAVE, i2c_addr) < 0) die("I2C_SLAVE");
+    i2c_state.interval_ns = (uint64_t)std::max(1, i2c_interval_ms) * 1000000ULL;
+    i2c_state.next_poll_ns = monotonic_ns();
+
+    for (const auto& kv : i2c_button_map) {
+      uint32_t pin = kv.first;
+      if (pin < 2 || pin > 13) continue;
+      uint32_t bit = pin - 2;
+      i2c_state.button_bits[bit] = I2cButtonBinding{pin, kv.second};
+    }
+
+    if (!i2c_disable_axes) {
+      for (const auto& desc : kDefaultI2cAnalogs) {
+        I2cAnalogAxisState axis;
+        axis.raw_index = desc.raw_index;
+        axis.label = desc.label;
+        axis.abs_code = desc.abs_code;
+        axis.max_seen = 1;
+        axis.last_scaled = -1;
+        i2c_state.analogs.push_back(axis);
+        analog_axis_setup.push_back(AbsAxisSetup{desc.abs_code, 0, 100});
+      }
+    }
+  }
+
+  bool have_i2c_inputs = i2c_state.enabled && (!i2c_state.button_bits.empty() || !i2c_state.analogs.empty());
+
+  if (watched.empty() && !have_i2c_inputs) {
+    std::cerr << "No lines could be requested and no I2C inputs configured.\n"
               << "On Android: run as root, and ensure /dev/gpiochip* and /dev/uinput are accessible.\n";
     return 1;
+  } else if (watched.empty() && have_i2c_inputs) {
+    std::cerr << "WARN: no GPIO lines requested; running with I2C inputs only.\n";
   }
 
   // Determine needed uinput devices and capabilities.
@@ -709,26 +906,29 @@ int main(int argc, char** argv) {
   std::set<int> gamepad_buttons;
   std::set<int> keyboard_keys;
 
-  for (const auto& kv : map) {
-    const Action& a = kv.second;
+  auto consider_needed = [&](const Action& a) {
     if (a.type == ActionType::HatDir) {
       need_gamepad = true;
       need_hat = true;
-    } else {
-      if (a.dev == DeviceKind::Gamepad) {
-        need_gamepad = true;
-        gamepad_buttons.insert(a.code);
-      } else {
-        need_keyboard = true;
-        keyboard_keys.insert(a.code);
-      }
+      return;
     }
-  }
+    if (a.dev == DeviceKind::Gamepad) {
+      need_gamepad = true;
+      gamepad_buttons.insert(a.code);
+    } else {
+      need_keyboard = true;
+      keyboard_keys.insert(a.code);
+    }
+  };
+
+  for (const auto& kv : gpio_map) consider_needed(kv.second);
+  for (const auto& kv : i2c_button_map) consider_needed(kv.second);
+  if (!analog_axis_setup.empty()) need_gamepad = true;
 
   int ufd_gamepad = -1;
   int ufd_keyboard = -1;
 
-  if (need_gamepad) ufd_gamepad = create_uinput_gamepad(gamepad_buttons, need_hat);
+  if (need_gamepad) ufd_gamepad = create_uinput_gamepad(gamepad_buttons, need_hat, analog_axis_setup);
   if (need_keyboard) ufd_keyboard = create_uinput_keyboard(keyboard_keys);
 
   std::cerr << "Watching " << watched.size() << " GPIO lines.\n";
@@ -736,6 +936,15 @@ int main(int argc, char** argv) {
   std::cerr << "Debounce: " << debounce_us << " us (kernel attr if supported + userspace filter)\n";
   if (need_gamepad) std::cerr << "Gamepad device: enabled (hat=" << (need_hat ? "yes" : "no") << ")\n";
   if (need_keyboard) std::cerr << "Keyboard device: enabled\n";
+  if (i2c_state.enabled) {
+    char addrbuf[16];
+    std::snprintf(addrbuf, sizeof(addrbuf), "0x%02X", i2c_addr & 0xFF);
+    std::cerr << "I2C device: " << i2c_dev_path
+              << " addr=" << addrbuf
+              << " interval=" << i2c_interval_ms << "ms"
+              << " analog_axes=" << i2c_state.analogs.size()
+              << " digital_mapped=" << i2c_state.button_bits.size() << "\n";
+  }
 
   // Userspace debounce state: last accepted event timestamp per offset
   const uint64_t debounce_ns = (uint64_t)debounce_us * 1000ULL;
@@ -760,6 +969,34 @@ int main(int argc, char** argv) {
     }
   };
 
+  auto emit_action = [&](const Action& act, bool press, uint64_t ts, const std::string& origin_desc) {
+    if (act.type == ActionType::HatDir) {
+      switch (act.hat_dir) {
+        case HatDir::Up:    hat_up    = press; break;
+        case HatDir::Down:  hat_down  = press; break;
+        case HatDir::Left:  hat_left  = press; break;
+        case HatDir::Right: hat_right = press; break;
+      }
+      recompute_hat();
+    } else {
+      int outfd = (act.dev == DeviceKind::Gamepad) ? ufd_gamepad : ufd_keyboard;
+      if (outfd >= 0) uinput_key(outfd, act.code, press);
+    }
+
+    std::cout << "t_ns=" << ts << " " << origin_desc
+              << " token=" << act.token
+              << " -> " << (press ? "DOWN" : "UP");
+
+    if (act.type == ActionType::HatDir) {
+      std::cout << " (hat x=" << last_hat_x << " y=" << last_hat_y << ")";
+    } else {
+      std::cout << " (dev=" << (act.dev == DeviceKind::Gamepad ? "gamepad" : "keyboard")
+                << " code=" << act.code << ")";
+    }
+    std::cout << "\n";
+    std::cout.flush();
+  };
+
   std::vector<pollfd> pfds(watched.size());
   for (size_t i = 0; i < watched.size(); i++) {
     pfds[i].fd = watched[i].req_fd;
@@ -768,86 +1005,151 @@ int main(int argc, char** argv) {
   }
 
   std::vector<gpio_v2_line_event> evbuf(128);
+  std::vector<uint16_t> i2c_raw(kI2cAnalogValueCount);
+
+  auto handle_i2c = [&]() {
+    if (!i2c_state.enabled) return;
+    uint8_t buf[kI2cFrameBytes];
+    ssize_t n = ::read(i2c_state.fd, buf, sizeof(buf));
+    if (n != (ssize_t)sizeof(buf)) {
+      if (!i2c_state.read_error_logged) {
+        std::cerr << "WARN: I2C read failed (got " << n << " bytes)\n";
+        i2c_state.read_error_logged = true;
+      }
+      return;
+    }
+    i2c_state.read_error_logged = false;
+
+    for (size_t i = 0; i < kI2cAnalogValueCount; i++) {
+      i2c_raw[i] = get_u16_le(&buf[i * 2]);
+    }
+    uint16_t mask = get_u16_le(&buf[kI2cAnalogValueCount * 2]);
+
+    if (i2c_log_samples) {
+      std::cout << "i2c_raw=";
+      for (size_t i = 0; i < kI2cAnalogValueCount; i++) {
+        if (i) std::cout << ",";
+        std::cout << i2c_raw[i];
+      }
+      std::cout << " dmask=0x" << std::hex << mask << std::dec << "\n";
+      std::cout.flush();
+    }
+
+    bool analog_changed = false;
+    if (!i2c_state.analogs.empty() && ufd_gamepad >= 0) {
+      for (auto& axis : i2c_state.analogs) {
+        if (axis.raw_index >= kI2cAnalogValueCount) continue;
+        uint16_t raw = i2c_raw[axis.raw_index];
+        uint16_t sample = std::max<uint16_t>(static_cast<uint16_t>(1), raw);
+        if (sample > axis.max_seen) axis.max_seen = sample;
+        int scaled = (int)((uint64_t)raw * 100ULL /
+                           std::max<uint16_t>(static_cast<uint16_t>(1), axis.max_seen));
+        if (scaled > 100) scaled = 100;
+        if (scaled != axis.last_scaled) {
+          uinput_abs(ufd_gamepad, axis.abs_code, scaled);
+          axis.last_scaled = scaled;
+          analog_changed = true;
+        }
+      }
+      if (analog_changed) uinput_syn(ufd_gamepad);
+    }
+
+    uint16_t changed = i2c_state.have_mask ? (mask ^ i2c_state.last_mask) : 0;
+    i2c_state.last_mask = mask;
+    i2c_state.have_mask = true;
+    if (changed) {
+      for (uint32_t bit = 0; bit < 12; ++bit) {
+        if (!(changed & (1u << bit))) continue;
+        bool level_high = (mask & (1u << bit)) != 0;
+        bool press = active_low ? !level_high : level_high;
+        uint64_t ts = monotonic_ns();
+        uint32_t pin = bit + 2;
+        std::string origin = "i2c_pin=D" + std::to_string(pin);
+
+        auto it = i2c_state.button_bits.find(bit);
+        if (it == i2c_state.button_bits.end()) {
+          std::cout << "t_ns=" << ts << " " << origin
+                    << " (unmapped) -> " << (press ? "DOWN" : "UP") << "\n";
+          std::cout.flush();
+          continue;
+        }
+        emit_action(it->second.action, press, ts, origin);
+      }
+    }
+  };
 
   while (true) {
-    int r = poll(pfds.data(), pfds.size(), -1);
+    int timeout_ms = -1;
+    if (i2c_state.enabled) {
+      uint64_t now = monotonic_ns();
+      if (now >= i2c_state.next_poll_ns) {
+        timeout_ms = 0;
+      } else {
+        uint64_t delta_ns = i2c_state.next_poll_ns - now;
+        timeout_ms = (int)std::min<uint64_t>(delta_ns / 1000000ULL, (uint64_t)INT_MAX);
+        if (timeout_ms == 0 && delta_ns > 0) timeout_ms = 1;
+      }
+    }
+
+    int r = poll(pfds.data(), pfds.size(), timeout_ms);
     if (r < 0) {
       if (errno == EINTR) continue;
       die("poll()");
     }
+    if (r > 0) {
+      for (size_t i = 0; i < pfds.size(); i++) {
+        if (!(pfds[i].revents & POLLIN)) continue;
 
-    for (size_t i = 0; i < pfds.size(); i++) {
-      if (!(pfds[i].revents & POLLIN)) continue;
+        while (true) {
+          ssize_t n = read(pfds[i].fd, evbuf.data(), evbuf.size() * sizeof(gpio_v2_line_event));
+          if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            die("read(gpio event)");
+          }
+          if (n == 0) break;
 
-      while (true) {
-        ssize_t n = read(pfds[i].fd, evbuf.data(), evbuf.size() * sizeof(gpio_v2_line_event));
-        if (n < 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          die("read(gpio event)");
-        }
-        if (n == 0) break;
+          size_t cnt = (size_t)n / sizeof(gpio_v2_line_event);
+          for (size_t k = 0; k < cnt; k++) {
+            const auto& e = evbuf[k];
+            uint32_t off = e.offset;
 
-        size_t cnt = (size_t)n / sizeof(gpio_v2_line_event);
-        for (size_t k = 0; k < cnt; k++) {
-          const auto& e = evbuf[k];
-          uint32_t off = e.offset;
+            auto it = gpio_map.find(off);
+            if (it == gpio_map.end()) continue;
 
-          auto it = map.find(off);
-          if (it == map.end()) continue;
+            bool is_rising  = (e.id == GPIO_V2_LINE_EVENT_RISING_EDGE);
+            bool is_falling = (e.id == GPIO_V2_LINE_EVENT_FALLING_EDGE);
+            if (!is_rising && !is_falling) continue;
 
-          bool is_rising  = (e.id == GPIO_V2_LINE_EVENT_RISING_EDGE);
-          bool is_falling = (e.id == GPIO_V2_LINE_EVENT_FALLING_EDGE);
-          if (!is_rising && !is_falling) continue;
-
-          // Userspace debounce: drop edges too close together on the same GPIO.
-          uint64_t ts = e.timestamp_ns;
-          auto lt = last_accept_ns.find(off);
-          if (debounce_ns > 0 && lt != last_accept_ns.end()) {
-            if (ts >= lt->second && (ts - lt->second) < debounce_ns) {
-              continue;
+            // Userspace debounce: drop edges too close together on the same GPIO.
+            uint64_t ts = e.timestamp_ns;
+            auto lt = last_accept_ns.find(off);
+            if (debounce_ns > 0 && lt != last_accept_ns.end()) {
+              if (ts >= lt->second && (ts - lt->second) < debounce_ns) {
+                continue;
+              }
             }
-          }
-          last_accept_ns[off] = ts;
+            last_accept_ns[off] = ts;
 
-          bool press = active_low ? is_falling : is_rising;
+            bool press = active_low ? is_falling : is_rising;
 
-          const Action& act = it->second;
-
-          if (act.type == ActionType::HatDir) {
-            switch (act.hat_dir) {
-              case HatDir::Up:    hat_up    = press; break;
-              case HatDir::Down:  hat_down  = press; break;
-              case HatDir::Left:  hat_left  = press; break;
-              case HatDir::Right: hat_right = press; break;
+            const Action& act = it->second;
+            std::string nm("-");
+            for (const auto& L : watched) {
+              if (L.offset == off && !L.name.empty()) { nm = L.name; break; }
             }
-            recompute_hat();
-          } else {
-            int outfd = (act.dev == DeviceKind::Gamepad) ? ufd_gamepad : ufd_keyboard;
-            if (outfd >= 0) uinput_key(outfd, act.code, press);
+
+            std::string origin = "offset=" + std::to_string(off) + " name=" + nm;
+            emit_action(act, press, ts, origin);
           }
-
-          // Log
-          std::string nm("-");
-          for (const auto& L : watched) {
-            if (L.offset == off && !L.name.empty()) { nm = L.name; break; }
-          }
-
-          std::cout << "t_ns=" << ts
-                    << " offset=" << off
-                    << " name=" << nm
-                    << " token=" << act.token
-                    << " -> " << (press ? "DOWN" : "UP");
-
-          if (act.type == ActionType::HatDir) {
-            std::cout << " (hat x=" << last_hat_x << " y=" << last_hat_y << ")";
-          } else {
-            std::cout << " (dev=" << (act.dev == DeviceKind::Gamepad ? "gamepad" : "keyboard")
-                      << " code=" << act.code << ")";
-          }
-
-          std::cout << "\n";
-          std::cout.flush();
         }
+      }
+    }
+
+    if (i2c_state.enabled) {
+      uint64_t now = monotonic_ns();
+      if (now >= i2c_state.next_poll_ns) {
+        handle_i2c();
+        i2c_state.next_poll_ns = now + i2c_state.interval_ns;
       }
     }
   }
