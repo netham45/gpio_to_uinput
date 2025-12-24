@@ -53,9 +53,11 @@
 #include <climits>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -675,7 +677,9 @@ struct I2cAnalogAxisState {
   size_t raw_index;
   std::string label;
   uint16_t abs_code;
-  uint16_t max_seen = 1;
+  uint16_t min_seen = std::numeric_limits<uint16_t>::max();
+  uint16_t max_seen = 0;
+  bool initialized = false;
   int last_scaled = -1;
 };
 
@@ -699,6 +703,9 @@ struct I2cAnalogChannelDesc {
 
 static constexpr size_t kI2cAnalogValueCount = 5;
 static constexpr size_t kI2cFrameBytes = (kI2cAnalogValueCount + 1) * sizeof(uint16_t);
+static constexpr uint16_t kI2cAnalogAdcMax = 1023;
+static constexpr uint16_t kI2cAnalogInitialSpan = 512;
+static constexpr uint16_t kI2cAnalogMinSpan = 32;
 
 static const I2cAnalogChannelDesc kDefaultI2cAnalogs[] = {
   {"A0", 0, ABS_X},
@@ -710,9 +717,9 @@ static const I2cAnalogChannelDesc kDefaultI2cAnalogs[] = {
 
 int main(int argc, char** argv) {
   std::string chip_path = "/dev/gpiochip0";
-  uint32_t start = 2;
+  uint32_t start = 5;
   uint32_t end = 27;
-  uint32_t debounce_us = 10000;
+  uint32_t debounce_us = 1000;
   uint32_t event_buf_sz = 256;
   std::string map_path;
   std::string i2c_dev_path;
@@ -1025,6 +1032,7 @@ int main(int argc, char** argv) {
     }
     uint16_t mask = get_u16_le(&buf[kI2cAnalogValueCount * 2]);
 
+    std::string analog_log;
     if (i2c_log_samples) {
       std::cout << "i2c_raw=";
       for (size_t i = 0; i < kI2cAnalogValueCount; i++) {
@@ -1032,19 +1040,57 @@ int main(int argc, char** argv) {
         std::cout << i2c_raw[i];
       }
       std::cout << " dmask=0x" << std::hex << mask << std::dec << "\n";
-      std::cout.flush();
+      analog_log.reserve(i2c_state.analogs.size() * 48);
     }
 
     bool analog_changed = false;
     if (!i2c_state.analogs.empty() && ufd_gamepad >= 0) {
       for (auto& axis : i2c_state.analogs) {
         if (axis.raw_index >= kI2cAnalogValueCount) continue;
-        uint16_t raw = i2c_raw[axis.raw_index];
-        uint16_t sample = std::max<uint16_t>(static_cast<uint16_t>(1), raw);
+        uint16_t sample = i2c_raw[axis.raw_index];
+
+        if (!axis.initialized) {
+          axis.initialized = true;
+          uint16_t half = kI2cAnalogInitialSpan / 2;
+          uint16_t min_seed = (sample > half) ? static_cast<uint16_t>(sample - half) : 0;
+          uint16_t max_seed = static_cast<uint16_t>(min_seed + kI2cAnalogInitialSpan);
+          if (max_seed > kI2cAnalogAdcMax) {
+            max_seed = kI2cAnalogAdcMax;
+            min_seed = (max_seed > kI2cAnalogInitialSpan)
+                           ? static_cast<uint16_t>(max_seed - kI2cAnalogInitialSpan)
+                           : 0;
+          }
+          if (max_seed < sample) max_seed = sample;
+          axis.min_seen = min_seed;
+          axis.max_seen = std::max<uint16_t>(static_cast<uint16_t>(axis.min_seen + kI2cAnalogMinSpan), max_seed);
+        }
+
+        if (sample < axis.min_seen) axis.min_seen = sample;
         if (sample > axis.max_seen) axis.max_seen = sample;
-        int scaled = (int)((uint64_t)raw * 100ULL /
-                           std::max<uint16_t>(static_cast<uint16_t>(1), axis.max_seen));
-        if (scaled > 100) scaled = 100;
+
+        uint16_t span = (axis.max_seen > axis.min_seen)
+                            ? static_cast<uint16_t>(axis.max_seen - axis.min_seen)
+                            : 0;
+        if (span < kI2cAnalogMinSpan) span = kI2cAnalogMinSpan;
+
+        int clamped = std::clamp<int>(sample, axis.min_seen, axis.max_seen);
+        int scaled = (clamped - axis.min_seen) * 100 / span;
+        if (scaled < 0) scaled = 0;
+        else if (scaled > 100) scaled = 100;
+
+        if (i2c_log_samples) {
+          char buf[128];
+          std::snprintf(buf, sizeof(buf),
+                        " %s raw=%u min=%u max=%u span=%u scaled=%d",
+                        axis.label.c_str(),
+                        (unsigned)sample,
+                        (unsigned)axis.min_seen,
+                        (unsigned)axis.max_seen,
+                        (unsigned)span,
+                        scaled);
+          analog_log.append(buf);
+        }
+
         if (scaled != axis.last_scaled) {
           uinput_abs(ufd_gamepad, axis.abs_code, scaled);
           axis.last_scaled = scaled;
@@ -1052,6 +1098,14 @@ int main(int argc, char** argv) {
         }
       }
       if (analog_changed) uinput_syn(ufd_gamepad);
+      if (i2c_log_samples) {
+        if (!analog_log.empty()) {
+          std::cout << "i2c_axes:" << analog_log << "\n";
+        }
+        std::cout.flush();
+      }
+    } else if (i2c_log_samples) {
+      std::cout.flush();
     }
 
     uint16_t changed = i2c_state.have_mask ? (mask ^ i2c_state.last_mask) : 0;
