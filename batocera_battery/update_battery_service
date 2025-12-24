@@ -1,0 +1,4 @@
+#!/bin/bash
+(while x=x; do /userdata/system/update_battery.sh; sleep 15;done) &
+sleep 5
+kill -9 $(ps -ef | awk '$8 ~ /^emulationstation/{print $2}')
