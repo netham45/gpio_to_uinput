@@ -1,0 +1,6 @@
+[Unit]
+Description=Update virtual battery level
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/update_battery.sh

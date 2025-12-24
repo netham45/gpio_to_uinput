@@ -1,0 +1,13 @@
+[Unit]
+Description=Run update_battery.sh every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=1s
+Persistent=true
+Unit=update_battery.service
+
+[Install]
+WantedBy=timers.target
+
