@@ -1,0 +1,43 @@
+# gpio.map for gpio_to_uinput.cpp (hat dpad + gamepad buttons + keyboard hotkey)
+
+# D-pad as keyboard
+#D Up
+D9  KEY_UP
+#D Down
+D11 KEY_DOWN
+#D Left
+D12 KEY_LEFT
+#D Right
+D10 KEY_RIGHT
+
+# Face button
+#East
+D4 KEY_ESC
+#South
+D3 KEY_ENTER
+#West
+D5 KEY_TAB
+#North
+D2 KEY_BACKSPACE
+
+# Start/Select
+#Start
+8 KEY_HOME
+#Select
+25 KEY_END
+
+# Triggers
+#L Trigger
+24 KEY_PAGEUP
+#R Trigger
+23 KEY_PAGEDOWN
+
+# Volume controls
+#2
+D6 KEY_VOLUMEUP
+#3
+D7 KEY_VOLUMEDOWN
+
+# Fullscreen
+#1
+D8 KEY_SPACE
